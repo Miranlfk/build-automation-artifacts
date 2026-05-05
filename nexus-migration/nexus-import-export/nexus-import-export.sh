@@ -82,6 +82,9 @@ Include/exclude object types:
   --no-content-selectors  Do not export/import content selectors
   --no-privileges         Do not export/import privileges
   --no-roles              Do not export/import roles
+  --only-selectors        Export/import content selectors only
+  --only-privileges       Export/import privileges only
+  --only-roles            Export/import roles only
 
 Password environment variables:
   NEXUS_PASS              Password for either command
@@ -180,6 +183,24 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-roles)
       INCLUDE_ROLES="false"
+      shift
+      ;;
+    --only-selectors)
+      INCLUDE_SELECTORS="true"
+      INCLUDE_PRIVILEGES="false"
+      INCLUDE_ROLES="false"
+      shift
+      ;;
+    --only-privileges)
+      INCLUDE_SELECTORS="false"
+      INCLUDE_PRIVILEGES="true"
+      INCLUDE_ROLES="false"
+      shift
+      ;;
+    --only-roles)
+      INCLUDE_SELECTORS="false"
+      INCLUDE_PRIVILEGES="false"
+      INCLUDE_ROLES="true"
       shift
       ;;
     -h|--help)
@@ -574,6 +595,10 @@ import_roles() {
   local updated=0
   local failed=0
 
+  # Pass 1: Create all role shells with empty nested-roles array.
+  # This ensures every role ID exists before pass 2 wires up cross-references.
+  # Non-nx-* roles are always deleted first then recreated fresh.
+  log "Roles pass 1/2: creating role shells..."
   while IFS= read -r role; do
     local id
     id="$(echo "$role" | jq -r '.id')"
@@ -587,10 +612,107 @@ import_roles() {
     local encoded_id
     encoded_id="$(urlencode "$id")"
 
-    log "Role: $id"
+    local shell_payload
+    shell_payload="$(
+      echo "$role" | jq '{
+        id,
+        name,
+        description,
+        privileges: (.privileges // []),
+        roles: []
+      }'
+    )"
 
-    local payload
-    payload="$(
+    if [[ "$id" != nx-* ]]; then
+      # Non-nx-* roles: delete first (ignore 404), then always create fresh
+      local delete_status
+      delete_status="$(api_delete "$ROLES_API/$encoded_id")"
+      if [[ "$delete_status" == "200" || "$delete_status" == "204" ]]; then
+        log "Deleted existing role: $id"
+      elif [[ "$delete_status" == "404" ]]; then
+        log "Role does not exist yet, will create: $id"
+      else
+        warn "Unexpected status deleting role '$id'. HTTP $delete_status"
+        cat "$response_file" >&2
+        failed=$((failed + 1))
+        continue
+      fi
+
+      local post_status
+      post_status="$(api_post "$ROLES_API" "$shell_payload")"
+      case "$post_status" in
+        200|201|204)
+          log "Created role shell: $id"
+          created=$((created + 1))
+          ;;
+        *)
+          warn "Failed creating role shell '$id'. HTTP $post_status"
+          cat "$response_file" >&2
+          failed=$((failed + 1))
+          ;;
+      esac
+    else
+      # nx-* roles: attempt create, skip if already present
+      local post_status
+      post_status="$(api_post "$ROLES_API" "$shell_payload")"
+      case "$post_status" in
+        200|201|204)
+          log "Created role shell: $id"
+          created=$((created + 1))
+          ;;
+        400|409)
+          if grep -q 'PARAMETER id' "$response_file" 2>/dev/null; then
+            log "Role '$id' has corrupt id on server — deleting and recreating shell..."
+            local delete_status
+            delete_status="$(api_delete "$ROLES_API/$encoded_id")"
+            if [[ "$delete_status" == "200" || "$delete_status" == "204" ]]; then
+              local recreate_status
+              recreate_status="$(api_post "$ROLES_API" "$shell_payload")"
+              case "$recreate_status" in
+                200|201|204)
+                  log "Recreated role shell: $id"
+                  created=$((created + 1))
+                  ;;
+                *)
+                  warn "Failed recreating role shell '$id'. HTTP $recreate_status"
+                  cat "$response_file" >&2
+                  failed=$((failed + 1))
+                  ;;
+              esac
+            else
+              warn "Failed deleting corrupt role '$id'. HTTP $delete_status"
+              cat "$response_file" >&2
+              failed=$((failed + 1))
+            fi
+          else
+            log "Role shell already exists, skipping: $id"
+            updated=$((updated + 1))
+          fi
+          ;;
+        *)
+          warn "Failed creating role shell '$id'. HTTP $post_status"
+          cat "$response_file" >&2
+          failed=$((failed + 1))
+          ;;
+      esac
+    fi
+  done < <(jq -c '.roles // [] | .[]' "$FILE")
+
+  # Pass 2: Update every role with its full payload including nested role references.
+  log "Roles pass 2/2: applying nested role references..."
+  while IFS= read -r role; do
+    local id
+    id="$(echo "$role" | jq -r '.id')"
+
+    if [[ -z "$id" || "$id" == "null" ]]; then
+      continue
+    fi
+
+    local encoded_id
+    encoded_id="$(urlencode "$id")"
+
+    local full_payload
+    full_payload="$(
       echo "$role" | jq '{
         id,
         name,
@@ -600,48 +722,15 @@ import_roles() {
       }'
     )"
 
-    local post_status
-    post_status="$(api_post "$ROLES_API" "$payload")"
+    local put_status
+    put_status="$(api_put "$ROLES_API/$encoded_id" "$full_payload")"
 
-    case "$post_status" in
-      200|201|204)
-        log "Created role: $id"
-        created=$((created + 1))
-        ;;
-      400|409)
-        # Check if the error is the "PARAMETER id must not be empty" case,
-        # which means the existing role on Nexus has a missing/corrupt id.
-        # In that case, delete the broken role and recreate it.
-        if grep -q 'PARAMETER id' "$response_file" 2>/dev/null; then
-          log "Role '$id' has corrupt id on server — deleting and recreating..."
-          local delete_status
-          delete_status="$(api_delete "$ROLES_API/$encoded_id")"
-          if [[ "$delete_status" == "200" || "$delete_status" == "204" ]]; then
-            local recreate_status
-            recreate_status="$(api_post "$ROLES_API" "$payload")"
-            case "$recreate_status" in
-              200|201|204)
-                log "Recreated role: $id"
-                created=$((created + 1))
-                ;;
-              *)
-                warn "Failed recreating role '$id' after delete. HTTP $recreate_status"
-                cat "$response_file" >&2
-                failed=$((failed + 1))
-                ;;
-            esac
-          else
-            warn "Failed deleting corrupt role '$id'. HTTP $delete_status"
-            cat "$response_file" >&2
-            failed=$((failed + 1))
-          fi
-        else
-          log "Role already exists, skipping: $id"
-          updated=$((updated + 1))
-        fi
+    case "$put_status" in
+      200|204)
+        log "Updated role: $id"
         ;;
       *)
-        warn "Failed creating role '$id'. HTTP $post_status"
+        warn "Failed updating role '$id' with nested references. HTTP $put_status"
         cat "$response_file" >&2
         failed=$((failed + 1))
         ;;
