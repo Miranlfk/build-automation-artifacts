@@ -27,11 +27,11 @@ set -euo pipefail
 
 # Log messages with formatting
 log_info() {
-    echo -e "\033[1;32m[WSO2 Maven Release]\033[0m $1"
+    echo -e "\033[1;32m[WSO2 Maven Release]\033[0m $1" >&2
 }
 
 log_warn() {
-    echo -e "\033[1;33m[WARNING]\033[0m $1"
+    echo -e "\033[1;33m[WARNING]\033[0m $1" >&2
 }
 
 log_error() {
@@ -156,11 +156,14 @@ find_artifacts() {
     fi
     
     # 4. Check in Maven local repository
-    local group_path=$(echo "$group_id" | tr '.' '/')
-    local repo_dir="${workspace_dir}/.repository/${group_path}/${artifact_id}/${version}"
-    if [[ -d "$repo_dir" ]]; then
-        log_info "Found Maven repository directory at: $repo_dir"
-        artifacts+=("$repo_dir")
+    # Pass the group-level directory so all sibling modules at the same version are discovered.
+    # The version filter passed to collect_all_artifacts ensures only the release version is uploaded.
+    local group_path
+    group_path=$(echo "$group_id" | tr '.' '/')
+    local repo_group_dir="${workspace_dir}/.repository/${group_path}"
+    if [[ -d "$repo_group_dir" ]]; then
+        log_info "Found Maven repository group directory at: $repo_group_dir"
+        artifacts+=("$repo_group_dir")
     fi
     
     # Return as space-separated string
@@ -182,11 +185,27 @@ log_info "  Repository:  $NEXUS_REPOSITORY"
 #   2. Maven project checkout layout (target/checkout/):
 #      Coordinates are read from each module's pom.xml.
 # Output format (one line per file): groupId|artifactId|version|type|filepath
+# collect_all_artifacts BASE_DIR [FILTER_VERSION]
+# If FILTER_VERSION is provided, only artifacts matching that version are emitted.
+# This is used when scanning a broad directory (e.g. the .repository group dir)
+# to avoid uploading unrelated cached dependencies.
 collect_all_artifacts() {
     local base_dir="$1"
+    local filter_version="${2:-}"
     local found_any=0
 
     log_info "Recursively scanning for Maven artifacts in: $base_dir"
+    [[ -n "$filter_version" ]] && log_info "  (filtering to version: $filter_version)"
+
+    # Determine the root used for stripping group paths in Maven repo layout.
+    # If base_dir is inside a .repository directory, use that as the strip root
+    # so that e.g. .repository/com/wso2/test/mytest/2.9.18 yields group com.wso2.test.
+    local strip_root
+    if [[ "$base_dir" == *"/.repository"* || "$base_dir" == *"/.repository" ]]; then
+        strip_root="${base_dir%%/.repository*}/.repository"
+    else
+        strip_root="$base_dir"
+    fi
 
     # --- Strategy 1: Maven local repository layout ---
     # Identify by presence of .pom files (not pom.xml)
@@ -196,11 +215,13 @@ collect_all_artifacts() {
         version=$(basename "$dir")
         artifact_id=$(basename "$(dirname "$dir")")
         group_path_dir=$(dirname "$(dirname "$dir")")
-        rel_path="${group_path_dir#${base_dir}}"
+        rel_path="${group_path_dir#${strip_root}}"
         rel_path="${rel_path#/}"
         group_id=$(echo "$rel_path" | tr '/' '.')
 
         [[ -z "$group_id" || -z "$artifact_id" || -z "$version" ]] && continue
+        # Skip versions that don't match the release version (avoids uploading cached deps)
+        [[ -n "$filter_version" && "$version" != "$filter_version" ]] && continue
 
         found_any=1
         echo "${group_id}|${artifact_id}|${version}|pom|${pom_file}"
@@ -214,10 +235,12 @@ collect_all_artifacts() {
                 echo "${group_id}|${artifact_id}|${version}|javadoc|${artifact_file}"
             elif [[ "$fname" == *".war" ]]; then
                 echo "${group_id}|${artifact_id}|${version}|war|${artifact_file}"
+            elif [[ "$fname" == *".zip" ]]; then
+                echo "${group_id}|${artifact_id}|${version}|zip|${artifact_file}"
             elif [[ "$fname" == *".jar" ]]; then
                 echo "${group_id}|${artifact_id}|${version}|jar|${artifact_file}"
             fi
-        done < <(find "$dir" -maxdepth 1 -type f \( -name "*.jar" -o -name "*.war" \) 2>/dev/null)
+        done < <(find "$dir" -maxdepth 1 -type f \( -name "*.jar" -o -name "*.war" -o -name "*.zip" \) 2>/dev/null)
 
     done < <(find "$base_dir" -type f -name "*.pom" 2>/dev/null | sort)
 
@@ -258,13 +281,82 @@ collect_all_artifacts() {
                     echo "${group_id}|${artifact_id}|${version}|javadoc|${artifact_file}"
                 elif [[ "$fname" == *".war" ]]; then
                     echo "${group_id}|${artifact_id}|${version}|war|${artifact_file}"
+                elif [[ "$fname" == *".zip" ]]; then
+                    echo "${group_id}|${artifact_id}|${version}|zip|${artifact_file}"
                 elif [[ "$fname" == *".jar" ]]; then
                     echo "${group_id}|${artifact_id}|${version}|jar|${artifact_file}"
                 fi
-            done < <(find "$target_dir" -maxdepth 1 -type f \( -name "*.jar" -o -name "*.war" \) 2>/dev/null)
+            done < <(find "$target_dir" -maxdepth 1 -type f \( -name "*.jar" -o -name "*.war" -o -name "*.zip" \) 2>/dev/null)
 
         done < <(find "$base_dir" -name "pom.xml" -not -path "*/target/*" 2>/dev/null | sort)
     fi
+}
+
+# Validate that all expected artifacts are present for every discovered component.
+# Each component must have at least a .pom AND a main artifact (.jar or .war).
+# Missing files indicate an incomplete Maven build, not a deployment issue.
+# Returns 1 and logs errors if any component is incomplete.
+validate_all_components() {
+    local artifacts_file="$1"
+    local validation_failed=0
+
+    log_info "Validating all discovered components before upload..."
+
+    while IFS='|' read -r gid aid ver; do
+        local has_pom=0 has_main=0 missing=()
+
+        while IFS='|' read -r _gid _aid _ver type file_path; do
+            if [[ ! -f "$file_path" ]]; then
+                missing+=("[$type] $file_path")
+                continue
+            fi
+            [[ "$type" == "pom" ]]                              && has_pom=1
+            [[ "$type" == "jar" || "$type" == "war" || "$type" == "zip" ]] && has_main=1
+        done < <(grep "^${gid}|${aid}|${ver}|" "$artifacts_file")
+
+        local component_ok=1
+
+        if [[ "$has_pom" -eq 0 ]]; then
+            log_error "Component ${gid}:${aid}:${ver} is missing its POM file."
+            log_error "  This indicates an incomplete Maven build. Check the Maven release build logs."
+            component_ok=0
+        fi
+
+        # A pom-only component (has_main=0) is valid — it is a pom-packaging aggregator/parent module.
+        # Do NOT require a main artifact; only require the POM itself.
+
+        if [[ "${#missing[@]}" -gt 0 ]]; then
+            log_error "Component ${gid}:${aid}:${ver} has artifact file(s) listed but not found on disk:"
+            for m in "${missing[@]}"; do
+                log_error "    $m"
+            done
+            log_error "  This indicates an incomplete Maven build. Check the Maven release build logs."
+            component_ok=0
+        fi
+
+        if [[ "$component_ok" -eq 1 ]]; then
+            if [[ "$has_main" -eq 0 ]]; then
+                log_info "  ✅ ${gid}:${aid}:${ver} — pom-only module (aggregator/parent), no main artifact required."
+            else
+                log_info "  ✅ ${gid}:${aid}:${ver} — all required artifacts present."
+            fi
+        else
+            validation_failed=1
+        fi
+
+    done < <(cut -d'|' -f1-3 "$artifacts_file" | sort -u)
+
+    if [[ "$validation_failed" -ne 0 ]]; then
+        log_error "====================================================================================================="
+        log_error "Artifact validation failed. One or more components are incomplete."
+        log_error "This is likely caused by a failure during the Maven build/release phase, not the upload phase."
+        log_error "Please review the Maven release build output above for compilation or packaging errors."
+        log_error "====================================================================================================="
+        return 1
+    fi
+
+    log_info "All components validated successfully."
+    return 0
 }
 
 # Upload a single Maven component (one groupId:artifactId:version) to Nexus 3.
@@ -293,8 +385,13 @@ upload_to_nexus() {
     # Set packaging based on found artifacts
     if echo "$artifacts_lines" | grep -q "|war|"; then
         curl_cmd+=" -F \"maven2.packaging=war\""
-    else
+    elif echo "$artifacts_lines" | grep -q "|zip|"; then
+        curl_cmd+=" -F \"maven2.packaging=zip\""
+    elif echo "$artifacts_lines" | grep -qE "\|jar\|"; then
         curl_cmd+=" -F \"maven2.packaging=jar\""
+    else
+        # pom-only module (aggregator/parent)
+        curl_cmd+=" -F \"maven2.packaging=pom\""
     fi
 
     local asset_index=1
@@ -320,6 +417,8 @@ upload_to_nexus() {
             fi
         elif [[ "$type" == "war" ]]; then
             extension="war"
+        elif [[ "$type" == "zip" ]]; then
+            extension="zip"
         else
             extension="jar"
         fi
@@ -382,7 +481,7 @@ trap 'rm -f "$TEMP_ARTIFACTS"' EXIT
 
 while IFS= read -r base_dir; do
     [[ -d "$base_dir" ]] || continue
-    collect_all_artifacts "$base_dir" >> "$TEMP_ARTIFACTS"
+    collect_all_artifacts "$base_dir" "$MVN_RELEASE_VERSION" >> "$TEMP_ARTIFACTS"
 done <<< "$(echo "$ARTIFACT_DIRS" | tr ' ' '\n')"
 
 # Remove duplicate lines (same file appearing via multiple base dirs)
@@ -398,6 +497,11 @@ log_info "Discovered the following artifacts:"
 while IFS='|' read -r gid aid ver type fpath; do
     [[ -n "$fpath" ]] && log_info "  [${type}] ${gid}:${aid}:${ver}  ->  $fpath"
 done < "$TEMP_ARTIFACTS"
+
+# Validate all components are complete before attempting any uploads
+if ! validate_all_components "$TEMP_ARTIFACTS"; then
+    exit 1
+fi
 
 # Upload each unique Maven component (groupId:artifactId:version) separately
 UPLOAD_FAILED=0

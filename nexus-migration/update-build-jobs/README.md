@@ -1,58 +1,64 @@
-# Update Build Jobs Script
+# Update Maven Build Job Configurations
 
-This Jenkins Groovy script updates Maven Release job configurations across all Jenkins jobs as part of a Nexus 3 migration. It enables bulk updates to Maven Release build goals and adds a Managed Script post-build step to all qualifying jobs, with support for a safe dry-run mode.
+A Jenkins Script Console Groovy script that **bulk-updates existing Maven/FreeStyle Jenkins jobs** to add the configuration required for publishing to Maven Central alongside the existing Nexus workflow. Run it once during the migration to avoid manually editing every job.
 
 ## What It Does
 
-For every Jenkins job that uses the **M2 Release Build Wrapper** (excluding configured folders):
+For each qualifying job (those that already have an `M2ReleaseBuildWrapper`), the script applies up to **6 configuration changes**:
 
-1. **Updates Maven Release goals** — replaces the existing goals/options with the configured value and enables **Nexus 3 upload**.
-2. **Adds/verifies a Managed Script post-build step** — ensures the specified managed script is present as a post-build step and is set to run only when the build succeeds.
+| Step | Change | Details |
+|---|---|---|
+| 1 | **Credentials Binding** | Adds a `UsernamePassword` binding for credential ID `maven-central-token`, exposing `CENTRAL_TOKEN_USERNAME` and `CENTRAL_TOKEN_PASSWORD` |
+| 2 | **Config File Provider** | Binds managed settings file `<file_id>` to the variable `CENTRAL_SETTINGS_XML` |
+| 3 | **EnvInject** | Adds `CENTRAL_PUBLISHING_TYPE=USER_MANAGED` to the job's injected environment properties |
+| 4 | **Release Goals** | Injects `-Dmaven.deploy.skip=true` inside the `-Darguments="..."` block of the M2 release goals to suppress the default Maven deploy during a release build |
+| 4b | **Nexus 3 Upload flag** | Enables the "Use Nexus3 Upload" boolean flag on the `M2ReleaseBuildWrapper` via reflection |
+| 5 & 6 | **Post-build Steps** | Adds `nexus-sh` and `maven-central-sh` as `ScriptBuildStep` post-build steps (in that order) if not already present |
+
+Each change is idempotent — already-configured jobs are left unchanged and logged as skipped.
 
 ## Configuration
 
 Edit the variables at the top of the script before running:
 
-| Variable | Default | Description |
-|---|---|---|
-| `dryRun` | `true` | When `true`, logs planned changes without applying them. Set to `false` to apply changes. |
-| `excludedFolder` | `"iam-cloud"` | Jobs under this top-level folder are skipped. |
-| `newGoals` | *(see script)* | The Maven Release goals and options to set on all matching jobs. |
-| `managedScriptName` | `"XYZ"` | The name of the Managed Script to add/verify as a post-build step. |
+```groovy
+def MODE          = "single"                      // "single" | "folder" | "list"
+def SINGLE_JOB_NAME = "test-jobs/maven-tester-support"  // full job path for single mode
+def FOLDER_PATH   = "my-folder"                   // Jenkins folder path for folder mode
+def EXCLUDED_FOLDERS = ["iam-cloud"]              // folders whose jobs must never be touched
+def DRY_RUN       = false                         // true = report only, false = apply changes
+```
+
+## Modes
+
+| Mode | Behaviour |
+|---|---|
+| `single` | Updates one specific job identified by `SINGLE_JOB_NAME` |
+| `folder` | Updates all qualifying jobs (with `M2ReleaseBuildWrapper`) found anywhere under `FOLDER_PATH` |
+| `list` | Diagnostic mode — prints all visible job paths with a `[M2Release]` marker for qualifying jobs. No changes are made. |
+
+## Dry Run
+
+Set `DRY_RUN = true` to preview all changes that _would_ be made without writing anything to Jenkins. The output clearly marks each change as pending. Set to `false` to apply.
+
+## Required Jenkins Plugins
+
+| Plugin | Used For |
+|---|---|
+| [M2 Release Plugin](https://plugins.jenkins.io/m2release/) | Detecting and modifying `M2ReleaseBuildWrapper` |
+| [Credentials Binding Plugin](https://plugins.jenkins.io/credentials-binding/) | `SecretBuildWrapper` / `UsernamePasswordMultiBinding` |
+| [Config File Provider Plugin](https://plugins.jenkins.io/config-file-provider/) | `ConfigFileBuildWrapper` / `ManagedFile` |
+| [EnvInject Plugin](https://plugins.jenkins.io/envinject/) | `EnvInjectBuildWrapper` |
+| [Managed Scripts Plugin](https://plugins.jenkins.io/managed-scripts/) | `ScriptBuildStep` (post-build steps) |
 
 ## Usage
 
-1. Open the Jenkins **Script Console** (`Manage Jenkins → Script Console`).
-2. Paste the contents of `updateBuilds.groovy`.
-3. Adjust the configuration variables at the top as needed.
-4. Run with `dryRun = true` first to review the planned changes in the output log.
-5. Set `dryRun = false` and run again to apply the changes.
-
-## Output
-
-The script logs each job it processes with status indicators:
-
-| Symbol | Meaning |
-|---|---|
-| 🚫 | Job skipped (excluded folder). |
-| 🔍 | Job is being checked. |
-| 🛠️ | Maven Release configuration is being updated. |
-| ✅ | Configuration already up to date; no change needed. |
-| ➕ | Managed Script post-build step is being added. |
-| 🔁 | Managed Script run condition is being updated. |
-| 📝 | Changes would be saved (dry-run mode). |
-| 💾 | Changes saved. |
-| 🔸 | No changes needed for this job. |
-
-## Prerequisites
-
-The following Jenkins plugins must be installed:
-
-- [M2 Release Plugin](https://plugins.jenkins.io/m2release/) — provides `M2ReleaseBuildWrapper`.
-- [Managed Script Plugin](https://plugins.jenkins.io/managed-scripts/) — provides `ManagedScript`.
+1. Open Jenkins → **Manage Jenkins** → **Script Console**.
+2. Paste the contents of `update-build-jobs.groovy`.
+3. Set `DRY_RUN = true` and run to preview changes.
+4. Review the output, then set `DRY_RUN = false` and run again to apply.
 
 ## Notes
 
-- Only **Freestyle/Maven project** jobs (`hudson.model.Project`) are processed. Pipeline jobs are not affected.
-- Jobs without an M2 Release Build Wrapper are silently skipped.
-- Changes are only persisted to disk when `dryRun = false` and `job.save()` is called.
+- Jobs under `EXCLUDED_FOLDERS` are skipped by prefix match on the full job name.
+- The script saves the job to disk (`job.save()`) only when `DRY_RUN = false` and a change was actually made.
